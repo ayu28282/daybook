@@ -74,16 +74,63 @@ const parseQuick = (raw) => {
     text = text.replace(tagM[0], "").trim();
   }
 
-  // time e.g. 3pm, 14:30, 9 am
-  const timeM = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i) || text.match(/\b(\d{1,2}):(\d{2})\b/);
-  if (timeM) {
-    let h = parseInt(timeM[1], 10);
-    const min = timeM[2] ? parseInt(timeM[2], 10) : 0;
-    const mer = timeM[3] ? timeM[3].toLowerCase() : null;
+  // explicit calendar date: "oct 20", "20 oct", "november 25", "nov 25th"
+  // parsed FIRST so its day-number isn't mistaken for a bare-hour time later.
+  let dateLocked = false;
+  const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, sept: 8, oct: 9, nov: 10, dec: 11 };
+  const monthAlt = Object.keys(months).join("|");
+  const applyMonthDay = (monName, dayNum) => {
+    const mi = months[monName.slice(0, monName === "sept" ? 4 : 3).toLowerCase()] ?? months[monName.toLowerCase()];
+    if (mi == null || dayNum < 1 || dayNum > 31) return false;
+    const now = dateOf(todayKey());
+    let year = now.getFullYear();
+    const candidate = new Date(year, mi, dayNum);
+    // if the date already passed this year, assume next year
+    if (candidate < now) { year += 1; }
+    dateKey = keyOf(new Date(year, mi, dayNum));
+    return true;
+  };
+  // "oct 20" / "october 20th"
+  let dm = text.match(new RegExp(`\\b(${monthAlt})[a-z]*\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, "i"));
+  if (dm && applyMonthDay(dm[1], parseInt(dm[2], 10))) { dateLocked = true; text = text.replace(dm[0], " ").replace(/\s+/g, " ").trim(); }
+  if (!dateLocked) {
+    // "20 oct" / "20th october"
+    dm = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${monthAlt})[a-z]*\\.?\\b`, "i"));
+    if (dm && applyMonthDay(dm[2], parseInt(dm[1], 10))) { dateLocked = true; text = text.replace(dm[0], " ").replace(/\s+/g, " ").trim(); }
+  }
+
+  // time: "3pm" / "9 am" / "14:30" / "4:30" / bare "4"
+  // withMer = explicit am/pm; colon = "H:MM" 24h-ish; bare = a lone hour number
+  const withMer = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  const colon = withMer ? null : text.match(/\b(\d{1,2}):(\d{2})\b/);
+  // bare hour: "at 4", "4" — but only a lone 1-2 digit number, not part of a date like "oct 20"
+  const bare = withMer || colon ? null : text.match(/\bat\s+(\d{1,2})\b/i) || text.match(/\b(\d{1,2})\b/);
+
+  if (withMer) {
+    let h = parseInt(withMer[1], 10);
+    const min = withMer[2] ? parseInt(withMer[2], 10) : 0;
+    const mer = withMer[3].toLowerCase();
     if (mer === "pm" && h < 12) h += 12;
     if (mer === "am" && h === 12) h = 0;
     time = `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
-    text = text.replace(timeM[0], "").trim();
+    text = text.replace(withMer[0], "").trim();
+  } else if (colon) {
+    let h = parseInt(colon[1], 10);
+    const min = parseInt(colon[2], 10);
+    // assume daytime: a colon hour of 1-7 with no am/pm means afternoon/evening
+    if (h >= 1 && h <= 7) h += 12;
+    if (h < 24 && min < 60) {
+      time = `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+      text = text.replace(colon[0], "").trim();
+    }
+  } else if (bare) {
+    let h = parseInt(bare[1], 10);
+    // realistic waking hours: 8-11 stay morning, 12 stays noon, 1-7 become afternoon/evening
+    if (h >= 1 && h <= 7) h += 12;
+    if (h >= 0 && h <= 23) {
+      time = `${String(h).padStart(2, "0")}:00`;
+      text = text.replace(bare[0], "").trim();
+    }
   }
 
   // relative + weekday dates
@@ -103,27 +150,29 @@ const parseQuick = (raw) => {
   };
   const strip = (re) => { text = text.replace(re, " ").replace(/\s+/g, " ").trim(); };
 
-  if (/\btoday\b/i.test(lower)) { setDay(0); strip(/\btoday\b/i); }
-  else if (/\btomorrow\b|\btmrw\b|\btmr\b/i.test(lower)) { setDay(1); strip(/\btomorrow\b|\btmrw\b|\btmr\b/i); }
-  else {
-    const days = { sun: 0, mon: 1, tue: 2, tues: 2, wed: 3, thu: 4, thur: 4, thurs: 4, fri: 5, sat: 6 };
-    for (const [name, idx] of Object.entries(days)) {
-      // capture any run of "next" words directly before the weekday, e.g. "next next monday"
-      const re = new RegExp(`\\b((?:next\\s+)*)${name}(day)?\\b`, "i");
-      const m = text.match(re);
-      if (m) {
-        const nextCount = (m[1].match(/next/gi) || []).length;
-        // "monday" or "next monday" -> coming monday (0 extra weeks). each additional "next" -> +1 week.
-        nextDow(idx, Math.max(0, nextCount - 1));
-        strip(re);
-        break;
+  if (!dateLocked) {
+    if (/\btoday\b/i.test(lower)) { setDay(0); strip(/\btoday\b/i); }
+    else if (/\btomorrow\b|\btmrw\b|\btmr\b/i.test(lower)) { setDay(1); strip(/\btomorrow\b|\btmrw\b|\btmr\b/i); }
+    else {
+      const days = { sun: 0, mon: 1, tue: 2, tues: 2, wed: 3, thu: 4, thur: 4, thurs: 4, fri: 5, sat: 6 };
+      for (const [name, idx] of Object.entries(days)) {
+        // capture any run of "next" words directly before the weekday, e.g. "next next monday"
+        const re = new RegExp(`\\b((?:next\\s+)*)${name}(day)?\\b`, "i");
+        const m = text.match(re);
+        if (m) {
+          const nextCount = (m[1].match(/next/gi) || []).length;
+          // "monday" or "next monday" -> coming monday (0 extra weeks). each additional "next" -> +1 week.
+          nextDow(idx, Math.max(0, nextCount - 1));
+          strip(re);
+          break;
+        }
       }
     }
-  }
 
-  // "in N days"
-  const inM = text.match(/\bin (\d{1,2}) days?\b/i);
-  if (inM) { setDay(parseInt(inM[1], 10)); strip(/\bin \d{1,2} days?\b/i); }
+    // "in N days"
+    const inM = text.match(/\bin (\d{1,2}) days?\b/i);
+    if (inM) { setDay(parseInt(inM[1], 10)); strip(/\bin \d{1,2} days?\b/i); }
+  }
 
   return { text: text.replace(/\s+/g, " ").trim(), dateKey, time, tag };
 };
